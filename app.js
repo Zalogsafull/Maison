@@ -160,7 +160,7 @@ async function elegirArchivo(hint) {
   await cargarPicker();
   return new Promise(ok => {
     const P = google.picker, vista = new P.DocsView(P.ViewId.DOCS).setMode(P.DocsViewMode.LIST);
-    if (vista.setFileIds && hint) vista.setFileIds(hint); else vista.setQuery(FILE_NAME);
+    if (vista.setFileIds && hint) vista.setFileIds(hint); else vista.setOwnedByMe(false).setMimeTypes('application/json');
     new P.PickerBuilder().addView(vista).setOAuthToken(S.token).setDeveloperKey(CFG.API_KEY).setAppId(CFG.APP_ID).setLocale('es')
       .setTitle('Elegí el archivo de Maison')
       .setCallback(r => { if (r.action === P.Action.PICKED) ok(r.docs && r.docs[0] ? r.docs[0].id : null); else if (r.action === P.Action.CANCEL) ok(null); })
@@ -213,7 +213,8 @@ $('#lShared').onclick = async () => {
   L.err('');
   try {
     if (!tokenValido()) await pedirToken('');
-    const id = await elegirArchivo(unirseId()); if (!id) return;
+    const id = await elegirArchivo(unirseId());
+    if (!id) { if (!unirseId()) L.msg('Si no aparece ningún archivo es porque todavía no te lo compartieron. Pedile a quien lleva los pagos que te comparta desde ⚙ Ajustes y abrí el link del mail que te llega.'); return; }
     await usarArchivo(id);
     toast('Listo: ya ves los datos compartidos');
   } catch (e) { L.msg(''); L.err(e.status === 404 ? 'No tenés acceso a ese archivo. Revisá que entraste con el mail invitado.' : e.message); }
