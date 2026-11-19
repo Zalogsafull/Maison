@@ -1,12 +1,13 @@
 /* Maison · Control de pagos BPS y DGI
-   Datos: un archivo JSON en Google Drive del dueño, compartido con lectores.
-   Auth: Google Identity Services (scope drive.file) + Google Picker para abrir archivos compartidos. */
+   Igual que Mis gastos: los datos se guardan primero en el teléfono (funciona sin conexión)
+   y se sincronizan con un archivo JSON en Google Drive (permiso drive.file: la app solo ve ese archivo).
+   La otra persona recibe el archivo compartido y lo abre una vez con el Picker de Google. */
 'use strict';
 const CFG = window.MAISON_CONFIG || {};
 const SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const APP_URL = CFG.APP_URL || (location.origin + location.pathname.replace(/index\.html$/, ''));
-const FILE_NAME = 'Maison - Pagos BPS y DGI.json';
-const MSG_DEF = 'Hola {nombre}! Te comparto la app de control de pagos de BPS y DGI de Maison. Entrá con esta cuenta de Google y elegí el archivo "' + FILE_NAME + '":\n\n{link}';
+const FILE_NAME = 'maison-pagos.json';
+const MSG_DEF = 'Hola {nombre}! Te comparto la app de control de pagos de BPS y DGI de Maison. Abrí este link, entrá con esta cuenta de Google y tocá Aceptar:\n\n{link}';
 
 const $ = s => document.querySelector(s);
 const nf0 = new Intl.NumberFormat('es-UY', { maximumFractionDigits: 0 });
@@ -26,169 +27,213 @@ const LS = {
   del(k) { try { localStorage.removeItem('maison.' + k); } catch (e) {} }
 };
 
-/* ================= estado ================= */
-let data = emptyData(), movs = [], vista = 'res', puedeEditar = true, editId = null;
-let fileId = LS.get('fileId'), fileMeta = null, token = null, tokenExp = 0, tokenClient = null, userEmail = LS.get('email');
-function emptyData() { return { app: 'maison-pagos', version: 1, movs: [], personas: [], mensaje: null }; }
-function setData(d) {
-  data = Object.assign(emptyData(), d || {});
-  movs = (data.movs || []).map(m => ({ ...m, monto: +m.monto, cotizacion: m.cotizacion != null ? +m.cotizacion : null }));
-  LS.set('cache', data);
+/* ================= estado local ================= */
+// data.movs: cada movimiento lleva t (hora del último cambio). data.borrados: {id: t} para que un borrado también se sincronice.
+// personas y mensaje llevan cfgT. Al juntar dos versiones gana siempre el cambio más nuevo.
+let data = norm(LS.get('datos')), movs = [], vista = 'res', puedeEditar = true, editId = null;
+let fileId = LS.get('fileId'), fileMeta = LS.get('fileMeta'), userEmail = LS.get('email');
+const S = { token: null, exp: 0, pendiente: !!LS.get('pendiente'), sinc: false, toque: false, error: '', timer: null };
+try { const t = LS.get('token'); if (t && t.t && t.e > Date.now()) { S.token = t.t; S.exp = t.e; } } catch (e) {}
+function norm(d) {
+  d = Object.assign({ app: 'maison-pagos', version: 2, movs: [], borrados: {}, personas: [], mensaje: null, cfgT: 0 }, d || {});
+  d.movs = (d.movs || []).map(m => ({ ...m, t: m.t || m.creado || 1 }));
+  d.borrados = d.borrados || {};
+  return d;
+}
+function aplicar(d) {
+  data = norm(d); LS.set('datos', data);
+  movs = data.movs.map(m => ({ ...m, monto: +m.monto, cotizacion: m.cotizacion != null ? +m.cotizacion : null }));
   render();
 }
+// Cambio hecho en este dispositivo: se guarda acá al instante y se sube a Drive enseguida.
+function cambiar(fn) {
+  const d = JSON.parse(JSON.stringify(data)); fn(d); aplicar(d);
+  S.pendiente = true; LS.set('pendiente', true); estadoSinc();
+  clearTimeout(S.timer); S.timer = setTimeout(() => sincronizar(), 1200);
+}
+function fusionar(a, b) {
+  a = norm(a); b = norm(b);
+  const bor = { ...a.borrados };
+  for (const [id, t] of Object.entries(b.borrados)) if (!bor[id] || t > bor[id]) bor[id] = t;
+  const map = {};
+  for (const m of [...a.movs, ...b.movs]) if (!map[m.id] || m.t > map[m.id].t) map[m.id] = m;
+  const movsF = Object.values(map).filter(m => !(bor[m.id] && bor[m.id] >= m.t));
+  const cfg = (b.cfgT || 0) > (a.cfgT || 0) ? b : a;
+  return norm({ app: 'maison-pagos', version: 2, movs: movsF, borrados: bor, personas: cfg.personas, mensaje: cfg.mensaje, cfgT: cfg.cfgT });
+}
+const canon = d => JSON.stringify({ m: [...d.movs].sort((x, y) => x.id < y.id ? -1 : 1), b: Object.keys(d.borrados).sort().map(k => [k, d.borrados[k]]), p: d.personas, s: d.mensaje, c: d.cfgT });
 
-/* ================= Google auth ================= */
-function waitFor(test, ms = 15000) {
-  return new Promise((res, rej) => { const t0 = Date.now(); (function p() { if (test()) return res(); if (Date.now() - t0 > ms) return rej(new Error('No cargó el servicio de Google. Revisá la conexión.')); setTimeout(p, 100); })(); });
-}
-async function initAuth() {
-  if (!CFG.CLIENT_ID || CFG.CLIENT_ID.startsWith('PEGAR')) throw new Error('Falta configurar CLIENT_ID en config.js');
-  await waitFor(() => window.google && google.accounts && google.accounts.oauth2);
-  if (!tokenClient) tokenClient = google.accounts.oauth2.initTokenClient({ client_id: CFG.CLIENT_ID, scope: SCOPE, callback: () => {} });
-}
-function getToken(interactive) {
-  if (token && Date.now() < tokenExp - 60000) return Promise.resolve(token);
-  return new Promise(async (res, rej) => {
-    try { await initAuth(); } catch (e) { return rej(e); }
-    tokenClient.callback = r => {
-      if (r.error) return rej(new Error(r.error === 'access_denied' ? 'No se dio permiso a Drive.' : r.error));
-      token = r.access_token; tokenExp = Date.now() + (r.expires_in || 3600) * 1000; res(token);
-    };
-    tokenClient.error_callback = e => rej(new Error(e && e.type === 'popup_closed' ? 'Se cerró la ventana de Google.' : 'No se pudo iniciar sesión.'));
-    tokenClient.requestAccessToken({ prompt: interactive ? 'select_account' : '', login_hint: userEmail || undefined });
+/* ================= Google: permiso (igual que Mis gastos) ================= */
+const tokenValido = () => !!S.token && Date.now() < S.exp - 60000;
+function cargarScript(src) { return new Promise((ok, mal) => { const s = document.createElement('script'); s.src = src; s.async = true; s.onload = ok; s.onerror = () => mal(new Error('No cargó el servicio de Google. Revisá la conexión.')); document.head.appendChild(s); }); }
+async function asegurarGIS() { if (!(window.google && google.accounts && google.accounts.oauth2)) await cargarScript('https://accounts.google.com/gsi/client'); }
+// Tiene que llamarse desde un toque (Google abre una ventanita).
+async function pedirToken(prompt) {
+  await asegurarGIS();
+  return new Promise((ok, mal) => {
+    try {
+      google.accounts.oauth2.initTokenClient({
+        client_id: CFG.CLIENT_ID, scope: SCOPE, prompt, login_hint: userEmail || undefined,
+        callback: r => { if (!r || r.error) return mal(new Error(r && r.error === 'access_denied' ? 'No se dio permiso a Drive.' : 'No se pudo conectar con Google.')); S.token = r.access_token; S.exp = Date.now() + (+r.expires_in || 3600) * 1000; LS.set('token', { t: S.token, e: S.exp }); S.toque = false; ok(); },
+        error_callback: e => mal(new Error(e && e.type === 'popup_closed' ? 'Se cerró la ventana de Google.' : e && e.type === 'popup_failed_to_open' ? 'El navegador bloqueó la ventana de Google.' : 'No se pudo conectar con Google.'))
+      }).requestAccessToken();
+    } catch (e) { mal(e); }
   });
 }
-async function api(url, opt = {}, retry = true) {
-  const t = await getToken(false);
-  const r = await fetch(url, { ...opt, headers: { ...(opt.headers || {}), Authorization: 'Bearer ' + t } });
-  if (r.status === 401 && retry) { token = null; return api(url, opt, false); }
-  if (!r.ok) { let m = r.status + ''; try { const j = await r.json(); m = (j.error && j.error.message) || m; } catch (e) {} const er = new Error(m); er.status = r.status; throw er; }
+async function api(url, opt = {}) {
+  if (!tokenValido()) { S.toque = true; const e = new Error('Hay que volver a conectar con Google.'); e.code = 'token'; throw e; }
+  const r = await fetch(url, { ...opt, headers: { ...(opt.headers || {}), Authorization: 'Bearer ' + S.token } });
+  if (r.status === 401) { S.token = null; S.exp = 0; LS.del('token'); S.toque = true; const e = new Error('Hay que volver a conectar con Google.'); e.code = 'token'; throw e; }
+  if (!r.ok) { let m = 'Error ' + r.status; try { const j = await r.json(); m = (j.error && j.error.message) || m; } catch (e) {} const er = new Error(m); er.status = r.status; throw er; }
   return r.status === 204 ? null : r.json();
 }
 const DRV = 'https://www.googleapis.com/drive/v3/files';
 const UPL = 'https://www.googleapis.com/upload/drive/v3/files';
 
 /* ================= Drive ================= */
-async function whoAmI() {
-  const j = await api('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)');
-  userEmail = j.user.emailAddress; LS.set('email', userEmail); return j.user;
+async function quienSoy() { const j = await api('https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)'); userEmail = j.user.emailAddress; LS.set('email', userEmail); return j.user; }
+async function leerMeta() {
+  fileMeta = await api(DRV + '/' + fileId + '?fields=id,name,trashed,ownedByMe,webViewLink,capabilities(canEdit,canShare),owners(displayName,emailAddress)');
+  LS.set('fileMeta', fileMeta); permisos();
 }
-async function loadMeta() {
-  fileMeta = await api(DRV + '/' + fileId + '?fields=id,name,ownedByMe,modifiedTime,webViewLink,capabilities(canEdit,canShare),owners(displayName,emailAddress)');
-  puedeEditar = !!fileMeta.capabilities.canEdit;
+function permisos() {
+  puedeEditar = !fileMeta || !!(fileMeta.capabilities && fileMeta.capabilities.canEdit);
   document.body.classList.toggle('ro', !puedeEditar);
-  $('#modo').textContent = puedeEditar ? (fileMeta.ownedByMe ? 'Edición' : 'Edición compartida') : 'Solo lectura';
 }
-async function readFile() {
-  const t = await getToken(false);
-  const r = await fetch(DRV + '/' + fileId + '?alt=media&_=' + Date.now(), { headers: { Authorization: 'Bearer ' + t } });
-  if (!r.ok) { const e = new Error('No se pudo leer el archivo (' + r.status + ')'); e.status = r.status; throw e; }
-  const j = await r.json();
-  if (!j || j.app !== 'maison-pagos') throw new Error('Ese archivo no es de la app Maison.');
-  return j;
+async function bajar() { const t = S.token; const r = await fetch(DRV + '/' + fileId + '?alt=media', { headers: { Authorization: 'Bearer ' + t } }); if (r.status === 401) { S.toque = true; throw Object.assign(new Error('Hay que volver a conectar con Google.'), { code: 'token' }); } if (!r.ok) throw Object.assign(new Error('No se pudo leer el archivo (' + r.status + ')'), { status: r.status }); return r.json(); }
+async function subir(d) {
+  const cuerpo = JSON.stringify({ ...d, actualizado: new Date().toISOString(), actualizadoPor: userEmail || '' });
+  await api(UPL + '/' + fileId + '?uploadType=media', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: cuerpo });
 }
-async function writeFile(d) {
-  d.actualizado = new Date().toISOString(); d.actualizadoPor = userEmail || '';
-  await api(UPL + '/' + fileId + '?uploadType=media', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d, null, 1) });
+async function crearArchivo(d) {
+  const b = 'mz' + uid(), meta = { name: FILE_NAME, mimeType: 'application/json', description: 'Base de datos de la app Maison · Pagos BPS y DGI. No la edites a mano.' };
+  const body = `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(norm(d))}\r\n--${b}--`;
+  return (await api(UPL + '?uploadType=multipart&fields=id', { method: 'POST', headers: { 'Content-Type': 'multipart/related; boundary=' + b }, body })).id;
 }
-async function createFile(d) {
-  const boundary = 'mz' + uid();
-  const meta = { name: FILE_NAME, mimeType: 'application/json', description: 'Datos de la app Maison · Pagos BPS y DGI (' + APP_URL + ')' };
-  const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(d, null, 1)}\r\n--${boundary}--`;
-  const j = await api(UPL + '?uploadType=multipart&fields=id', { method: 'POST', headers: { 'Content-Type': 'multipart/related; boundary=' + boundary }, body });
-  return j.id;
+async function buscarPropio() {
+  const q = encodeURIComponent(`name='${FILE_NAME}' and trashed=false and 'me' in owners`);
+  const j = await api(DRV + '?q=' + q + '&spaces=drive&orderBy=modifiedTime%20desc&fields=files(id)');
+  return j.files && j.files[0] ? j.files[0].id : null;
 }
-/* Guarda aplicando el cambio sobre la última versión del archivo (por si otra persona editó). */
-let saving = Promise.resolve();
-function mutate(fn) {
-  saving = saving.then(async () => {
-    const fresh = await readFile();
-    const d = Object.assign(emptyData(), fresh);
-    fn(d);
-    await writeFile(d);
-    setData(d);
+// Baja lo de Drive, lo junta con lo de este teléfono y sube el resultado si cambió.
+async function sincronizar(manual) {
+  if (!fileId || S.sinc) return;
+  if (!tokenValido()) { S.toque = true; estadoSinc(); if (manual) await conectarYsinc(); return; }
+  S.sinc = true; S.error = ''; estadoSinc();
+  try {
+    await leerMeta();
+    if (fileMeta.trashed) throw new Error('El archivo de datos está en la papelera de Drive.');
+    const rem = await bajar();
+    if (!rem || rem.app !== 'maison-pagos') throw new Error('El archivo de Drive no es de la app Maison.');
+    const fus = puedeEditar ? fusionar(data, rem) : norm(rem);
+    if (canon(fus) !== canon(data)) aplicar(fus);
+    if (puedeEditar && canon(fus) !== canon(norm(rem))) await subir(fus);
+    S.pendiente = false; LS.set('pendiente', false); LS.set('ultima', Date.now());
+    if (manual) toast('Sincronizado con Drive');
+  } catch (e) { if (e.code !== 'token') S.error = e.message; if (manual && e.code !== 'token') toast(e.message); }
+  finally { S.sinc = false; estadoSinc(); }
+}
+async function conectarYsinc() { try { await pedirToken(''); await sincronizar(); } catch (e) { toast(e.message); } }
+function estadoSinc() {
+  const b = $('#modo');
+  if (!fileId) { b.textContent = 'Sin Drive'; return; }
+  if (S.sinc) b.innerHTML = '<span class="spin"></span>Drive';
+  else if (S.toque) b.textContent = '↻ Conectar Drive';
+  else if (S.error) b.textContent = '⚠ Drive';
+  else if (S.pendiente) b.textContent = 'Sin subir';
+  else b.textContent = puedeEditar ? '✓ Drive' : 'Solo lectura';
+  b.title = S.error || '';
+  $('#estado').textContent = S.error ? 'Drive: ' + S.error + ' (tocá el indicador de arriba para reintentar)' : '';
+}
+$('#modo').style.cursor = 'pointer';
+$('#modo').addEventListener('click', () => { if (S.toque || !tokenValido()) conectarYsinc(); else sincronizar(true); });
+
+/* ================= Picker (igual que Mis gastos) ================= */
+function cargarPicker() {
+  return new Promise((ok, mal) => {
+    const listo = () => window.gapi.load('picker', { callback: ok, onerror: () => mal(new Error('No cargó el selector de Google.')) });
+    if (window.gapi && window.gapi.load) return listo();
+    cargarScript('https://apis.google.com/js/api.js').then(listo, mal);
   });
-  return saving.catch(e => { saving = Promise.resolve(); throw e; });
+}
+async function elegirArchivo(hint) {
+  await cargarPicker();
+  return new Promise(ok => {
+    const P = google.picker, vista = new P.DocsView(P.ViewId.DOCS).setMode(P.DocsViewMode.LIST);
+    if (vista.setFileIds && hint) vista.setFileIds(hint); else vista.setQuery(FILE_NAME);
+    new P.PickerBuilder().addView(vista).setOAuthToken(S.token).setDeveloperKey(CFG.API_KEY).setAppId(CFG.APP_ID).setLocale('es')
+      .setTitle('Elegí el archivo de Maison')
+      .setCallback(r => { if (r.action === P.Action.PICKED) ok(r.docs && r.docs[0] ? r.docs[0].id : null); else if (r.action === P.Action.CANCEL) ok(null); })
+      .build().setVisible(true);
+  });
 }
 
-/* ================= Picker (archivos compartidos) ================= */
-async function pickShared() {
-  if (!CFG.API_KEY || !CFG.APP_ID || CFG.API_KEY.startsWith('PEGAR')) throw new Error('Falta configurar API_KEY y APP_ID en config.js');
-  await waitFor(() => window.gapi);
-  await new Promise(r => gapi.load('picker', r));
-  const t = await getToken(false);
-  return new Promise(res => {
-    const hint = new URLSearchParams(location.search).get('f');
-    const view = new google.picker.DocsView(google.picker.ViewId.DOCS).setMimeTypes('application/json').setIncludeFolders(false).setMode(google.picker.DocsViewMode.LIST);
-    if (hint && view.setFileIds) view.setFileIds(hint); else view.setQuery(FILE_NAME);
-    const p = new google.picker.PickerBuilder()
-      .addView(view)
-      .setOAuthToken(t).setDeveloperKey(CFG.API_KEY).setAppId(CFG.APP_ID)
-      .setTitle('Elegí el archivo de Maison').setLocale('es')
-      .setCallback(d => { if (d.action === google.picker.Action.PICKED) res(d.docs[0].id); else if (d.action === google.picker.Action.CANCEL) res(null); })
-      .build();
-    p.setVisible(true);
-  });
-}
-
-/* ================= arranque ================= */
+/* ================= entrada ================= */
+const unirseId = () => { const m = location.hash.match(/unirse=([\w-]+)/); return m ? m[1] : (LS.get('unirse') || null); };
+if (/unirse=/.test(location.hash)) { LS.set('unirse', unirseId()); history.replaceState(null, '', location.pathname + location.search); }
 const L = { err: t => { $('#lErr').textContent = t || ''; }, msg: t => { $('#lMsg').innerHTML = t || ''; } };
 function showLogin(step) {
   $('#login').hidden = false;
   $('#lStep1').hidden = step !== 1; $('#lStep2').hidden = step !== 2;
+  const inv = unirseId();
+  $('#lShared').textContent = inv ? 'Aceptar invitación' : 'Abrir archivo compartido conmigo';
+  if (step === 2 && inv) $('#lShared').classList.remove('ghost');
   L.err(''); L.msg('');
 }
-async function openFile(id) {
-  fileId = id; LS.set('fileId', id);
+async function usarArchivo(id, local) {
+  fileId = id; LS.set('fileId', id); LS.del('unirse');
   L.msg('<span class="spin"></span>Abriendo datos…');
-  await loadMeta();
-  setData(await readFile());
-  $('#login').hidden = true; $('#estado').textContent = '';
+  await leerMeta();
+  const rem = norm(await bajar());
+  if (local && fileMeta.capabilities.canEdit) { const f = fusionar(rem, local); aplicar(f); await subir(f); } else aplicar(rem);
+  S.pendiente = false; LS.set('pendiente', false); S.error = '';
+  $('#login').hidden = true; L.msg(''); estadoSinc();
 }
-async function start() {
-  const cache = LS.get('cache');
-  if (cache && fileId) { setData(cache); $('#login').hidden = true; $('#modo').textContent = 'Conectando…'; }
-  if (!fileId || !userEmail) { showLogin(1); return; }
-  try {
-    await getToken(false);
-    await openFile(fileId);
-  } catch (e) {
-    if (cache) { $('#estado').textContent = 'Sin conexión con Drive: mostrando la última copia. Tocá aquí para reconectar.'; $('#modo').textContent = 'Sin conexión'; puedeEditar = false; document.body.classList.add('ro'); }
-    else showLogin(1);
-  }
+function start() {
+  if (!CFG.CLIENT_ID) { showLogin(1); L.err('Falta configurar config.js'); return; }
+  aplicar(data); permisos();
+  if (fileId && !unirseId()) { $('#login').hidden = true; estadoSinc(); if (tokenValido()) sincronizar(); else { S.toque = true; estadoSinc(); } }
+  else if (userEmail && tokenValido()) { $('#lHola').textContent = '¿Qué datos querés usar?'; showLogin(2); }
+  else showLogin(1);
 }
-$('#estado').addEventListener('click', async () => { if (!/reconectar/.test($('#estado').textContent)) return; try { await getToken(true); await openFile(fileId); } catch (e) { toast(e.message); } });
-
 $('#lGoogle').onclick = async () => {
   L.err('');
   try {
-    await getToken(true);
-    const u = await whoAmI();
-    if (fileId) { try { await openFile(fileId); return; } catch (e) { fileId = null; LS.del('fileId'); } }
-    // ¿ya tiene un archivo creado por la app en su Drive?
-    const q = encodeURIComponent(`name='${FILE_NAME}' and trashed=false and 'me' in owners`);
-    const l = await api(DRV + '?q=' + q + '&fields=files(id)&spaces=drive');
-    if (l.files && l.files.length) { await openFile(l.files[0].id); return; }
+    await pedirToken(userEmail ? '' : 'select_account');
+    const u = await quienSoy();
+    if (unirseId()) { $('#lHola').textContent = 'Hola ' + (u.displayName || u.emailAddress) + '. Te invitaron a ver los pagos de Maison.'; showLogin(2); return; }
+    if (fileId) { await usarArchivo(fileId); return; }
+    const propio = await buscarPropio();
+    if (propio) { await usarArchivo(propio); return; }
     $('#lHola').textContent = 'Hola ' + (u.displayName || u.emailAddress) + '. ¿Qué datos querés usar?';
     showLogin(2);
-    if (new URLSearchParams(location.search).get('f')) $('#lShared').focus();
-  } catch (e) { L.err(e.message); }
+  } catch (e) { L.msg(''); L.err(e.message); }
 };
 $('#lShared').onclick = async () => {
   L.err('');
-  try { const id = await pickShared(); if (id) await openFile(id); } catch (e) { L.msg(''); L.err(e.status === 404 ? 'No tenés acceso a ese archivo.' : e.message); }
+  try {
+    if (!tokenValido()) await pedirToken('');
+    const id = await elegirArchivo(unirseId()); if (!id) return;
+    await usarArchivo(id);
+    toast('Listo: ya ves los datos compartidos');
+  } catch (e) { L.msg(''); L.err(e.status === 404 ? 'No tenés acceso a ese archivo. Revisá que entraste con el mail invitado.' : e.message); }
 };
-$('#lNew').onclick = async () => { L.err(''); try { L.msg('<span class="spin"></span>Creando archivo…'); await openFile(await createFile(emptyData())); } catch (e) { L.msg(''); L.err(e.message); } };
+$('#lNew').onclick = async () => { L.err(''); try { if (!tokenValido()) await pedirToken(''); L.msg('<span class="spin"></span>Creando archivo…'); await usarArchivo(await crearArchivo(norm(null))); } catch (e) { L.msg(''); L.err(e.message); } };
 $('#lImport').onchange = async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return; L.err('');
-  try { const d = JSON.parse(await f.text()); if (d.app !== 'maison-pagos' || !Array.isArray(d.movs)) throw new Error('El JSON no es de la app Maison.'); L.msg('<span class="spin"></span>Creando archivo…'); await openFile(await createFile(d)); }
-  catch (er) { L.msg(''); L.err(er.message); }
+  try {
+    const d = JSON.parse(await f.text()); if (d.app !== 'maison-pagos' || !Array.isArray(d.movs)) throw new Error('El JSON no es de la app Maison.');
+    if (!tokenValido()) await pedirToken('');
+    L.msg('<span class="spin"></span>Creando archivo…'); await usarArchivo(await crearArchivo(d));
+  } catch (er) { L.msg(''); L.err(er.message); }
 };
-$('#lOut').onclick = () => logout();
-function logout() {
-  if (token && window.google) try { google.accounts.oauth2.revoke(token, () => {}); } catch (e) {}
-  token = null; fileId = null; userEmail = null; LS.del('fileId'); LS.del('email'); LS.del('cache');
-  setData(emptyData()); $('#ovS').classList.remove('on'); showLogin(1);
+$('#lOut').onclick = () => logout(true);
+function logout(otraCuenta) {
+  if (S.token && window.google && google.accounts) try { google.accounts.oauth2.revoke(S.token, () => {}); } catch (e) {}
+  S.token = null; S.exp = 0; fileId = null; fileMeta = null; if (otraCuenta !== false) userEmail = null;
+  ['token', 'fileId', 'fileMeta', 'datos', 'pendiente', 'email'].forEach(k => LS.del(k));
+  aplicar(null); puedeEditar = true; document.body.classList.remove('ro');
+  $('#ovS').classList.remove('on'); showLogin(1);
 }
 
 /* ================= cálculos ================= */
@@ -351,16 +396,13 @@ $('#form').addEventListener('submit', async e => {
     const monto = num($('#fMonI').value); if (!(monto > 0)) return err('El monto tiene que ser mayor a 0.');
     d = { tipo: 'ingreso', moneda: st.mon, monto, obs: $('#fObs').value.trim(), fecha };
   }
-  $('#fSave').disabled = true; $('#fSave').textContent = 'Guardando…';
-  const id = editId;
-  try {
-    await mutate(D => {
-      if (id) { const i = D.movs.findIndex(x => x.id === id); if (i >= 0) D.movs[i] = { ...D.movs[i], ...d, id }; else D.movs.push({ ...d, id, creado: Date.now() }); }
-      else D.movs.push({ ...d, id: uid(), creado: Date.now() });
-    });
-    cerrar(); toast('Guardado en Drive');
-  } catch (x) { err(x.status === 403 ? 'No tenés permiso para editar este archivo.' : 'No se pudo guardar: ' + x.message); }
-  finally { $('#fSave').disabled = false; $('#fSave').textContent = 'Guardar'; }
+  const id = editId, t = Date.now();
+  cambiar(D => {
+    const i = id ? D.movs.findIndex(x => x.id === id) : -1;
+    if (i >= 0) D.movs[i] = { ...D.movs[i], ...d, id, t };
+    else D.movs.push({ ...d, id: id || uid(), creado: t, t });
+  });
+  cerrar(); toast('Guardado');
 });
 $('#fDel').onclick = () => {
   const m = movs.find(x => x.id === editId); if (!m) return;
@@ -369,44 +411,46 @@ $('#fDel').onclick = () => {
 };
 $('#cNo').onclick = () => $('#ovC').classList.remove('on');
 $('#cSi').onclick = async () => {
-  const id = editId; $('#cSi').disabled = true;
-  try { await mutate(D => { D.movs = D.movs.filter(x => x.id !== id); }); $('#ovC').classList.remove('on'); cerrar(); toast('Eliminado'); }
-  catch (x) { $('#ovC').classList.remove('on'); $('#fErr').textContent = 'No se pudo eliminar: ' + x.message; }
-  finally { $('#cSi').disabled = false; }
+  const id = editId;
+  cambiar(D => { D.movs = D.movs.filter(x => x.id !== id); D.borrados[id] = Date.now(); });
+  $('#ovC').classList.remove('on'); cerrar(); toast('Eliminado');
 };
 let toastT;
 function toast(t) { const e = $('#toast'); e.textContent = t; e.classList.add('on'); clearTimeout(toastT); toastT = setTimeout(() => e.classList.remove('on'), 2000); }
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('.tab'); if (!b) return; vista = b.dataset.v; document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x === b)); render(); });
 
-/* ================= ajustes: compartir ================= */
+/* ================= ajustes: compartir (igual que Mis gastos: Drive comparte el archivo y Google manda el mail) ================= */
 let permSel = 'reader', msgTimer = null;
-const linkApp = () => APP_URL + (fileId ? '?f=' + encodeURIComponent(fileId) : '');
-const mensajeDe = p => (data.mensaje || MSG_DEF).replace(/\{nombre\}/g, p.nombre).replace(/\{link\}/g, linkApp());
+const enlaceUnirse = () => APP_URL + (fileId ? '#unirse=' + fileId : '');
+const mensajeDe = p => (data.mensaje || MSG_DEF).replace(/\{nombre\}/g, p.nombre).replace(/\{link\}/g, enlaceUnirse());
 const gmailLink = p => 'https://mail.google.com/mail/?view=cm&fs=1&to=' + encodeURIComponent(p.email) + '&su=' + encodeURIComponent('Maison · Control de pagos BPS y DGI') + '&body=' + encodeURIComponent(mensajeDe(p));
+const puedoCompartir = () => !!(fileMeta && fileMeta.capabilities && fileMeta.capabilities.canShare && fileMeta.ownedByMe);
 function renderPers() {
-  const ps = data.personas || [], own = fileMeta && fileMeta.capabilities && fileMeta.capabilities.canShare;
+  const ps = data.personas || [], own = puedoCompartir();
   $('#pers').innerHTML = ps.length ? ps.map((p, i) => `<div class="per"><div class="av">${esc((p.nombre || '?')[0].toUpperCase())}</div>
     <div class="i"><div class="n">${esc(p.nombre)}</div><div class="e">${esc(p.email)}</div></div>
     <select data-role="${i}" ${own ? '' : 'disabled'} aria-label="Permiso"><option value="reader" ${p.permiso !== 'writer' ? 'selected' : ''}>Solo ver</option><option value="writer" ${p.permiso === 'writer' ? 'selected' : ''}>Puede editar</option></select>
-    <a class="gm" href="${gmailLink(p)}" target="_blank" rel="noopener" title="Reenviar link por Gmail">✉</a>
+    <a class="gm" href="${gmailLink(p)}" target="_blank" rel="noopener" title="Reenviar el link por Gmail">✉</a>
     ${own ? `<button class="mini" data-del="${i}" aria-label="Dejar de compartir">×</button>` : ''}</div>`).join('')
     : '<div class="empty" style="padding:14px">Todavía no compartiste los datos con nadie.</div>';
 }
 function renderFileInfo() {
-  if (!fileMeta) { $('#fileInfo').innerHTML = ''; return; }
-  const ow = fileMeta.owners && fileMeta.owners[0];
-  $('#fileInfo').innerHTML = `<a class="opt" href="${esc(fileMeta.webViewLink)}" target="_blank" rel="noopener"><span>${esc(fileMeta.name)}<small>${fileMeta.ownedByMe ? 'En tu Drive' : 'De ' + esc(ow ? (ow.displayName || ow.emailAddress) : 'otra persona')} · ${puedeEditar ? 'podés editar' : 'solo lectura'} · sesión: ${esc(userEmail || '')}</small></span>↗</a>`;
+  if (!fileMeta) { $('#fileInfo').innerHTML = '<div class="info" style="margin:0 0 8px">Sin archivo de Drive.</div>'; return; }
+  const ow = fileMeta.owners && fileMeta.owners[0], ult = LS.get('ultima');
+  $('#fileInfo').innerHTML = `<a class="opt" href="${esc(fileMeta.webViewLink)}" target="_blank" rel="noopener"><span>${esc(fileMeta.name)}<small>${fileMeta.ownedByMe ? 'En tu Drive' : 'De ' + esc(ow ? (ow.displayName || ow.emailAddress) : 'otra persona')} · ${puedeEditar ? 'podés editar' : 'solo lectura'}<br>${esc(userEmail || '')}${ult ? ' · sincronizado ' + new Date(ult).toLocaleString('es-UY', { dateStyle: 'short', timeStyle: 'short' }) : ''}</small></span>↗</a>
+  <button class="opt" id="oSync" type="button"><span>Sincronizar ahora<small>${S.pendiente ? 'Hay cambios sin subir' : 'Trae lo último de Drive'}</small></span>↻</button>`;
+  $('#oSync').onclick = () => sincronizar(true).then(renderFileInfo);
 }
 $('#gear').onclick = () => {
-  $('#sMsg').value = data.mensaje || MSG_DEF; $('#sMsg').disabled = !puedeEditar;
-  const own = fileMeta && fileMeta.capabilities && fileMeta.capabilities.canShare;
-  $('#pAdd').closest('.card').hidden = !own;
+  $('#sMsg').value = data.mensaje || MSG_DEF; $('#sMsg').disabled = !puedoCompartir();
+  $('#pAdd').closest('.card').hidden = !puedoCompartir();
   $('#oImportLbl').hidden = !puedeEditar;
   renderPers(); renderFileInfo(); $('#pErr').textContent = ''; $('#ovS').classList.add('on');
 };
 $('#sClose').onclick = () => $('#ovS').classList.remove('on');
 $('#ovS').addEventListener('click', e => { if (e.target.id === 'ovS') $('#ovS').classList.remove('on'); });
 $('#segPerm').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; permSel = b.dataset.p; document.querySelectorAll('#segPerm button').forEach(x => x.classList.toggle('on', x === b)); });
+async function conToken(fn) { if (!tokenValido()) await pedirToken(''); return fn(); }
 $('#pAdd').onclick = async () => {
   const nombre = $('#pNom').value.trim(), email = $('#pMail').value.trim().toLowerCase(), perr = t => { $('#pErr').textContent = t; };
   if (!nombre) return perr('Falta el nombre.');
@@ -415,10 +459,10 @@ $('#pAdd').onclick = async () => {
   const btn = $('#pAdd'); btn.disabled = true; btn.textContent = 'Compartiendo…'; perr('');
   try {
     const p = { nombre, email, permiso: permSel };
-    const qs = '?sendNotificationEmail=true&fields=id&emailMessage=' + encodeURIComponent(mensajeDe(p));
-    const perm = await api(DRV + '/' + fileId + '/permissions' + qs, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'user', role: permSel, emailAddress: email }) });
-    await mutate(D => { D.personas = [...(D.personas || []).filter(x => x.email !== email), { ...p, permId: perm.id, compartido: hoy() }]; });
-    $('#pNom').value = ''; $('#pMail').value = ''; renderPers(); toast('Compartido: Google le envió la invitación');
+    const perm = await conToken(() => api(DRV + '/' + fileId + '/permissions?sendNotificationEmail=true&fields=id&emailMessage=' + encodeURIComponent(mensajeDe(p)),
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'user', role: permSel, emailAddress: email }) }));
+    cambiar(D => { D.personas = [...(D.personas || []).filter(x => x.email !== email), { ...p, permId: perm.id, compartido: hoy() }]; D.cfgT = Date.now(); });
+    $('#pNom').value = ''; $('#pMail').value = ''; renderPers(); toast('Compartido: Google le mandó la invitación');
   } catch (x) { perr('No se pudo compartir: ' + x.message); }
   finally { btn.disabled = false; btn.textContent = 'Compartir y enviar invitación'; }
 };
@@ -426,8 +470,8 @@ $('#pers').addEventListener('change', async e => {
   const s = e.target.closest('[data-role]'); if (!s) return;
   const p = data.personas[+s.dataset.role], role = s.value;
   try {
-    if (p.permId) await api(DRV + '/' + fileId + '/permissions/' + p.permId, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) });
-    await mutate(D => { D.personas = D.personas.map(x => x.email === p.email ? { ...x, permiso: role } : x); });
+    if (p.permId) await conToken(() => api(DRV + '/' + fileId + '/permissions/' + p.permId, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) }));
+    cambiar(D => { D.personas = D.personas.map(x => x.email === p.email ? { ...x, permiso: role } : x); D.cfgT = Date.now(); });
     toast('Permiso actualizado');
   } catch (x) { toast('No se pudo cambiar: ' + x.message); renderPers(); }
 });
@@ -435,14 +479,14 @@ $('#pers').addEventListener('click', async e => {
   const d = e.target.closest('[data-del]'); if (!d) return;
   const p = data.personas[+d.dataset.del];
   try {
-    if (p.permId) await api(DRV + '/' + fileId + '/permissions/' + p.permId, { method: 'DELETE' }).catch(x => { if (x.status !== 404) throw x; });
-    await mutate(D => { D.personas = (D.personas || []).filter(x => x.email !== p.email); });
+    if (p.permId) await conToken(() => api(DRV + '/' + fileId + '/permissions/' + p.permId, { method: 'DELETE' })).catch(x => { if (x.status !== 404) throw x; });
+    cambiar(D => { D.personas = (D.personas || []).filter(x => x.email !== p.email); D.cfgT = Date.now(); });
     renderPers(); toast('Ya no se comparte con ' + p.nombre);
   } catch (x) { toast('No se pudo quitar: ' + x.message); }
 });
 $('#sMsg').addEventListener('input', () => {
   clearTimeout(msgTimer);
-  msgTimer = setTimeout(async () => { const v = $('#sMsg').value; try { await mutate(D => { D.mensaje = v; }); renderPers(); } catch (x) { toast('No se pudo guardar el mensaje'); } }, 900);
+  msgTimer = setTimeout(() => { const v = $('#sMsg').value; cambiar(D => { D.mensaje = v; D.cfgT = Date.now(); }); renderPers(); }, 900);
 });
 
 /* ================= ajustes: archivo ================= */
@@ -458,19 +502,21 @@ $('#oImport').onchange = async e => {
   catch (x) { toast(x.message); }
 };
 $('#iNo').onclick = () => { importData = null; $('#ovI').classList.remove('on'); };
-$('#iSi').onclick = async () => {
-  const d = importData; if (!d) return;
-  try { await mutate(D => { D.movs = d.movs; }); $('#ovI').classList.remove('on'); toast('Datos importados'); } catch (x) { toast('No se pudo importar: ' + x.message); }
+$('#iSi').onclick = () => {
+  const d = importData; if (!d) return; const t = Date.now();
+  cambiar(D => { for (const m of D.movs) D.borrados[m.id] = t; D.movs = d.movs.map((m, i) => ({ ...m, t: t + 1 + i })); });
+  $('#ovI').classList.remove('on'); toast('Datos importados');
 };
-$('#oSwitch').onclick = () => { $('#ovS').classList.remove('on'); fileId = null; fileMeta = null; LS.del('fileId'); LS.del('cache'); setData(emptyData()); $('#lHola').textContent = '¿Qué datos querés usar?'; showLogin(2); };
-$('#oLogout').onclick = logout;
+$('#oSwitch').onclick = () => {
+  if (S.pendiente) { toast('Hay cambios sin subir: tocá "Sincronizar ahora" primero'); return; }
+  $('#ovS').classList.remove('on'); fileId = null; fileMeta = null; ['fileId', 'fileMeta', 'datos', 'pendiente'].forEach(k => LS.del(k));
+  aplicar(null); puedeEditar = true; document.body.classList.remove('ro'); $('#lHola').textContent = '¿Qué datos querés usar?'; showLogin(tokenValido() ? 2 : 1);
+};
+$('#oLogout').onclick = () => { if (S.pendiente) { toast('Hay cambios sin subir: tocá "Sincronizar ahora" primero'); return; } logout(); };
 
 /* ================= refresco y PWA ================= */
-document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || !fileId || !token || Date.now() > tokenExp - 60000 || $('#login').hidden === false) return;
-  try { const d = await readFile(); if (d.actualizado !== data.actualizado) setData(d); } catch (e) {}
-});
-if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && fileId && tokenValido()) sincronizar(); });
+window.addEventListener('online', () => { if (fileId && tokenValido() && S.pendiente) sincronizar(); });
+if ('serviceWorker' in navigator && location.protocol === 'https:') window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 
-render();
 start();
