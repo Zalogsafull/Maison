@@ -223,7 +223,7 @@ $('#lNew').onclick = async () => { L.err(''); try { if (!tokenValido()) await pe
 $('#lImport').onchange = async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return; L.err('');
   try {
-    const d = JSON.parse(await f.text()); if (d.app !== 'maison-pagos' || !Array.isArray(d.movs)) throw new Error('El JSON no es de la app Maison.');
+    const d = JSON.parse((await f.text()).replace(/^\uFEFF/, '')); if (d.app !== 'maison-pagos' || !Array.isArray(d.movs)) throw new Error('El JSON no es de la app Maison.');
     if (!tokenValido()) await pedirToken('');
     L.msg('<span class="spin"></span>Creando archivo…'); await usarArchivo(await crearArchivo(d));
   } catch (er) { L.msg(''); L.err(er.message); }
@@ -499,7 +499,7 @@ $('#oExport').onclick = () => {
 let importData = null;
 $('#oImport').onchange = async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-  try { const d = JSON.parse(await f.text()); if (d.app !== 'maison-pagos' || !Array.isArray(d.movs)) throw new Error('El JSON no es de la app Maison.'); importData = d; $('#iTxt').textContent = `Se van a reemplazar los ${movs.length} movimientos actuales por los ${d.movs.length} del archivo. La lista de personas compartidas no cambia.`; $('#ovI').classList.add('on'); }
+  try { const d = JSON.parse((await f.text()).replace(/^\uFEFF/, '')); if (d.app !== 'maison-pagos' || !Array.isArray(d.movs)) throw new Error('El JSON no es de la app Maison.'); importData = d; $('#iTxt').textContent = `Se van a reemplazar los ${movs.length} movimientos actuales por los ${d.movs.length} del archivo. La lista de personas compartidas no cambia.`; $('#ovI').classList.add('on'); }
   catch (x) { toast(x.message); }
 };
 $('#iNo').onclick = () => { importData = null; $('#ovI').classList.remove('on'); };
