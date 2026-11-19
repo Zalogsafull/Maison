@@ -160,7 +160,7 @@ async function elegirArchivo(hint) {
   await cargarPicker();
   return new Promise(ok => {
     const P = google.picker, vista = new P.DocsView(P.ViewId.DOCS).setMode(P.DocsViewMode.LIST);
-    if (vista.setFileIds && hint) vista.setFileIds(hint); else vista.setOwnedByMe(false).setMimeTypes('application/json');
+    if (vista.setFileIds && hint) vista.setFileIds(hint); else vista.setQuery(FILE_NAME);
     new P.PickerBuilder().addView(vista).setOAuthToken(S.token).setDeveloperKey(CFG.API_KEY).setAppId(CFG.APP_ID).setLocale('es')
       .setTitle('Elegí el archivo de Maison')
       .setCallback(r => { if (r.action === P.Action.PICKED) ok(r.docs && r.docs[0] ? r.docs[0].id : null); else if (r.action === P.Action.CANCEL) ok(null); })

@@ -1,6 +1,6 @@
 /* Service worker: guarda la app para abrirla rápido y sin conexión.
    Los datos NO se cachean acá (viven en Google Drive). Subí VERSION al cambiar archivos. */
-const VERSION = 'maison-v4';
+const VERSION = 'maison-v5';
 const SHELL = ['./', 'index.html', 'app.js', 'config.js', 'manifest.webmanifest',
   'img/logo.webp', 'img/icon-192.png', 'img/icon-512.png', 'img/apple-touch-icon.png', 'img/favicon.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
